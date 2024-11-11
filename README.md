@@ -1,51 +1,263 @@
-# Langchain-RAG
-RAG Development
+[
+  {
+    "id": 1,
+    "question_text": "Retrieve all customers who have placed an order in the last 30 days.",
+    "schema": [
+      {
+        "table_name": "customers",
+        "columns": ["id", "name", "email"],
+        "primary_key": "id"
+      },
+      {
+        "table_name": "orders",
+        "columns": ["id", "customer_id", "order_date"],
+        "primary_key": "id",
+        "foreign_keys": ["customer_id -> customers.id"]
+      }
+    ],
+    "difficulty": "Intermediate",
+    "expected_query": "SELECT c.name, c.email FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.order_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY);",
+    "diagram_url": "https://example.com/er_diagram1.png"
+  }
+  // Add more questions as needed
+]
+# app/schemas.py
+from pydantic import BaseModel
+from typing import List, Optional
 
-grade_prompt = """
-Hello! I’m here to help you identify your vehicle’s grade or trim. Let’s go step by step so I can gather all the necessary details. At the end, I will summarize the information and give you the most accurate grade/trim I can determine. Please answer the following questions:
+class TableSchema(BaseModel):
+    table_name: str
+    columns: List[str]  # List of column names
+    primary_key: Optional[str] = None
+    foreign_keys: Optional[List[str]] = None  # e.g., ["orders.customer_id -> customers.id"]
 
-**Basic Information**:
-- What is the Make of your vehicle? (e.g., Nissan, Toyota)?
-- What is the Model of your vehicle? (e.g., Alto Lapin, Camry)?
+class Question(BaseModel):
+    id: int
+    question_text: str
+    schema: List[TableSchema]
+    difficulty: str  # e.g., "Beginner", "Intermediate", "Advanced"
+    expected_query: Optional[str] = None
+    diagram_url: Optional[str] = None  # URL to ER diagram image
 
-**Year of Manufacture**:
-- What is the Year of Manufacture? (If you’re unsure, we can continue without it.)
+@app.get("/api/questions/random", response_model=Question)
+async def get_random_question(difficulty: Optional[str] = None):
+    """
+    Retrieve a random SQL question, optionally filtered by difficulty.
+    """
+    filtered_questions = questions_db
+    if difficulty:
+        filtered_questions = [q for q in questions_db if q.difficulty.lower() == difficulty.lower()]
+        if not filtered_questions:
+            raise HTTPException(status_code=404, detail="No questions found for the specified difficulty")
 
-**Engine and Performance Information**:
-- What is the Engine Type (e.g., gasoline, diesel, hybrid)?
-- Do you know the Transmission Type (automatic or manual)?
+    return random.choice(filtered_questions)
 
-**Body Style**:
-- What is the Body Style of your car? (e.g., 4-seater, sedan, SUV, hatchback? If you’re not sure, let me know, and I can guide you.)
 
-**Trim/Grade-Specific Questions**:
-- **Interior Features**: Does your vehicle have leather seats, fabric seats, or a specific interior design? Any unique dashboard features or touchscreen displays?
-- **Technology**: Does it have advanced technology like a navigation system, advanced audio system, or driver assistance features (e.g., adaptive cruise control, parking sensors)?
-- **Exterior Features**: Does your car have distinctive exterior features such as unique wheel designs, special paint colors, or roof rails?
-- **Safety Features**: Are there any advanced safety systems like lane departure warning, collision mitigation, or ABS (anti-lock braking system)?
-- **Additional Options**: Does your car have any extra packages, like a sport package, luxury package, or any premium features?
-- **Alloy Wheels**: Does your car have alloy wheels?
-- **AC**: Does your vehicle have air conditioning?
+    # app/main.py
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from google.cloud import bigquery
+from app.database import client
+import re
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import logging
 
-**VIN Information**:
-- Do you know the VIN (Vehicle Identification Number)? This is optional but would help me access more precise information about your vehicle.
+app = FastAPI()
 
----
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-**Instructions**:
-1. **Ask each question in a conversational manner**, allowing the user to provide information step by step.
-2. **If the user is unsure about a detail**, respond with helpful clarification or ask additional questions to get more accurate information.
-   - Example: If the user is unsure about the body style, ask about seating capacity or if they know how many doors the car has.
-3. **If the user asks a question about a specific term (e.g., “What is a trim level?”)**, explain the term clearly and continue with the next question.
-   - Example: "The trim level refers to a specific version of a car model that includes unique features, options, and styling elements."
-4. **If the `iscompleted` parameter is true**: Summarize the information provided by the user and suggest the most likely trim/grade based on the details (make, model, year, engine, features, etc.). Return the `botmessage` containing the final result.
-5. **If the `iscompleted` parameter is false**: Continue asking the next question based on the previous inquiry. If the user provides an incomplete answer, ask follow-up questions to get more specific details or offer suggestions based on available information.
+# CORS configuration
+origins = [
+    "http://localhost",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    # Add more origins as needed
+]
 
----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # List of allowed origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-**Final Step**:
-Once all the details have been collected, I will summarize everything you’ve told me and provide the most accurate trim/grade of your vehicle that I can identify based on the information provided.
+# Rate Limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-Let's begin!
-"""
+# Define the request schema
+class QueryRequest(BaseModel):
+    query: str
 
+# Define the response schema
+class QueryResponse(BaseModel):
+    success: bool
+    rows: list = []
+    rowCount: int = 0
+    fields: list = []
+    error: str = ""
+
+# Allowed SQL commands for security
+ALLOWED_COMMANDS = {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+
+@app.post("/api/execute-sql", response_model=QueryResponse)
+@limiter.limit("10/minute")  # Limit to 10 requests per minute per IP
+async def execute_sql(query_request: QueryRequest, request: Request):
+    query = query_request.query.strip()
+    logger.info(f"Received query: {query}")
+
+    # Extract the first word of the query to check allowed commands
+    first_word = re.match(r"^\w+", query, re.IGNORECASE)
+    if not first_word:
+        logger.error("Invalid query format.")
+        raise HTTPException(status_code=400, detail="Invalid query format.")
+
+    command = first_word.group(0).upper()
+    if command not in ALLOWED_COMMANDS:
+        logger.error(f"Disallowed command: {command}")
+        raise HTTPException(status_code=400, detail=f"Only {', '.join(ALLOWED_COMMANDS)} statements are allowed.")
+
+    try:
+        query_job = client.query(query, job_config=bigquery.QueryJobConfig(
+            timeout_ms=60000,  # 60 seconds timeout
+        ))  # Make an API request.
+
+        results = query_job.result()  # Wait for the query to finish.
+
+        # Extract field names
+        fields = [field.name for field in results.schema]
+
+        # Extract rows as list of dictionaries
+        rows = [dict(row) for row in results]
+
+        logger.info(f"Query successful: {len(rows)} rows returned.")
+
+        return QueryResponse(
+            success=True,
+            rows=rows,
+            rowCount=len(rows),
+            fields=fields
+        )
+
+    except Exception as e:
+        logger.error(f"Query failed: {str(e)}")
+        return QueryResponse(
+            success=False,
+            error=str(e)
+        )
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SQL Assessment Platform</title>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.10.24/css/jquery.dataTables.min.css">
+  <style>
+    #editor-container {
+      width: 100%;
+      height: 300px;
+      border: 1px solid #ccc;
+    }
+    #execute-btn {
+      margin-top: 10px;
+      padding: 10px 20px;
+      font-size: 16px;
+    }
+    #results-container {
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>SQL Assessment</h1>
+  <div id="editor-container"></div>
+  <button id="execute-btn">Execute Query</button>
+  <div id="results-container"></div>
+
+  <!-- Dependencies -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.33.0/min/vs/loader.min.js"></script>
+  <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.10.24/js/jquery.dataTables.min.js"></script>
+
+  <script>
+    require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.33.0/min/vs' }});
+    require(['vs/editor/editor.main'], function() {
+      var editor = monaco.editor.create(document.getElementById('editor-container'), {
+        value: 'SELECT * FROM users;',
+        language: 'sql',
+        theme: 'vs-dark',
+        automaticLayout: true
+      });
+
+      document.getElementById('execute-btn').addEventListener('click', function() {
+        var query = editor.getValue();
+        // Send the query to the backend via API
+        fetch('/api/execute-sql', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ query: query })
+        })
+        .then(response => response.json())
+        .then(data => {
+          var resultsContainer = document.getElementById('results-container');
+          resultsContainer.innerHTML = ''; // Clear previous results
+
+          if (data.success) {
+            // Create a table to display results
+            var table = document.createElement('table');
+            table.id = 'results-table';
+            table.className = 'display';
+            var thead = document.createElement('thead');
+            var headerRow = document.createElement('tr');
+
+            data.fields.forEach(field => {
+              var th = document.createElement('th');
+              th.textContent = field;
+              headerRow.appendChild(th);
+            });
+
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
+            var tbody = document.createElement('tbody');
+            data.rows.forEach(row => {
+              var tr = document.createElement('tr');
+              data.fields.forEach(field => {
+                var td = document.createElement('td');
+                td.textContent = row[field];
+                tr.appendChild(td);
+              });
+              tbody.appendChild(tr);
+            });
+
+            table.appendChild(tbody);
+            resultsContainer.appendChild(table);
+
+            // Initialize DataTables
+            $('#results-table').DataTable();
+          } else {
+            // Display error message
+            var errorDiv = document.createElement('div');
+            errorDiv.style.color = 'red';
+            errorDiv.textContent = 'Error: ' + data.error;
+            resultsContainer.appendChild(errorDiv);
+          }
+        })
+        .catch(error => {
+          console.error('Error executing query:', error);
+        });
+      });
+    });
+  </script>
+</body>
+</html>
